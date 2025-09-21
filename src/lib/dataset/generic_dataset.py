@@ -1,7 +1,9 @@
+# 导入Python 2/3兼容性模块
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# 导入基础库
 import numpy as np
 import math
 import json
@@ -10,20 +12,24 @@ import os
 from collections import defaultdict
 import time
 
-import pycocotools.coco as coco
+# 导入第三方库
+import pycocotools.coco as coco  # COCO数据集工具
 import torch
-import torch.utils.data as data
+import torch.utils.data as data  # PyTorch数据加载工具
 
-from utils.image import flip, color_aug
-from utils.image import get_affine_transform, affine_transform
-from utils.image import gaussian_radius, draw_umich_gaussian, gaussian2D
-from utils.pointcloud import map_pointcloud_to_image, pc_dep_to_hm
-import copy
-from nuscenes.utils.data_classes import Box
-from pyquaternion import Quaternion
-from nuscenes.utils.geometry_utils import view_points
-from utils.ddd_utils import compute_box_3d, project_to_image, draw_box_3d
-from utils.ddd_utils import comput_corners_3d, alpha2rot_y, get_pc_hm
+# 导入自定义工具函数
+from utils.image import flip, color_aug  # 图像增强
+from utils.image import get_affine_transform, affine_transform  # 仿射变换
+from utils.image import gaussian_radius, draw_umich_gaussian, gaussian2D  # 高斯热图
+from utils.pointcloud import map_pointcloud_to_image, pc_dep_to_hm  # 点云处理
+import copy  # 深拷贝
+
+# 导入nuScenes相关工具
+from nuscenes.utils.data_classes import Box  # 3D框定义
+from pyquaternion import Quaternion  # 四元数
+from nuscenes.utils.geometry_utils import view_points  # 3D几何工具
+from utils.ddd_utils import compute_box_3d, project_to_image, draw_box_3d  # 3D检测工具
+from utils.ddd_utils import comput_corners_3d, alpha2rot_y, get_pc_hm  # 3D几何计算
 
 
 def get_dist_thresh(calib, ct, dim, alpha):
@@ -34,122 +40,187 @@ def get_dist_thresh(calib, ct, dim, alpha):
 
 
 class GenericDataset(data.Dataset):
-  default_resolution = None
-  num_categories = None
-  class_name = None
-  # cat_ids: map from 'category_id' in the annotation files to 1..num_categories
-  # Not using 0 because 0 is used for don't care region and ignore loss.
-  cat_ids = None
-  max_objs = None
-  rest_focal_length = 1200
-  num_joints = 17
+  """通用数据集类，继承自PyTorch的Dataset类
+  
+  该类提供了处理多种计算机视觉数据集的基础功能，包括：
+  - 数据加载和预处理
+  - 数据增强
+  - 点云数据处理
+  - 3D目标检测相关功能
+  
+  属性:
+    default_resolution: 默认输入分辨率
+    num_categories: 类别数量
+    class_name: 类别名称列表
+    cat_ids: 将标注文件中的category_id映射到1..num_categories
+    max_objs: 每张图像最大目标数
+    rest_focal_length: 默认焦距
+    num_joints: 关键点数量
+    flip_idx: 水平翻转时成对交换的关键点索引
+    edges: 关键点连接关系
+    mean: 图像归一化均值
+    std: 图像归一化标准差
+    _eig_val: PCA特征值(用于颜色增强)
+    _eig_vec: PCA特征向量(用于颜色增强)
+    ignore_val: 忽略区域的值
+    nuscenes_att_range: nuScenes属性范围映射
+    pc_mean: 点云数据归一化均值
+    pc_std: 点云数据归一化标准差
+    img_ind: 图像索引(用于调试)
+  """
+  default_resolution = None  # 默认输入分辨率 [width, height]
+  num_categories = None  # 类别数量
+  class_name = None  # 类别名称列表
+  # cat_ids: 将标注文件中的category_id映射到1..num_categories
+  # 不使用0因为0用于表示忽略区域
+  cat_ids = None  
+  max_objs = None  # 每张图像最大目标数
+  rest_focal_length = 1200  # 默认焦距
+  num_joints = 17  # 关键点数量
   flip_idx = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], 
-              [11, 12], [13, 14], [15, 16]]
+              [11, 12], [13, 14], [15, 16]]  # 水平翻转时成对交换的关键点索引
   edges = [[0, 1], [0, 2], [1, 3], [2, 4], 
            [4, 6], [3, 5], [5, 6], 
            [5, 7], [7, 9], [6, 8], [8, 10], 
            [6, 12], [5, 11], [11, 12], 
-           [12, 14], [14, 16], [11, 13], [13, 15]]
+           [12, 14], [14, 16], [11, 13], [13, 15]]  # 关键点连接关系
   mean = np.array([0.40789654, 0.44719302, 0.47026115],
-                   dtype=np.float32).reshape(1, 1, 3)
+                   dtype=np.float32).reshape(1, 1, 3)  # 图像归一化均值
   std  = np.array([0.28863828, 0.27408164, 0.27809835],
-                   dtype=np.float32).reshape(1, 1, 3)
+                   dtype=np.float32).reshape(1, 1, 3)  # 图像归一化标准差
   _eig_val = np.array([0.2141788, 0.01817699, 0.00341571],
-                      dtype=np.float32)
-  _eig_vec = np.array([
+                      dtype=np.float32)  # PCA特征值(用于颜色增强)
+  _eig_vec = np.array([  # PCA特征向量(用于颜色增强)
         [-0.58752847, -0.69563484, 0.41340352],
         [-0.5832747, 0.00994535, -0.81221408],
         [-0.56089297, 0.71832671, 0.41158938]
     ], dtype=np.float32)
-  ignore_val = 1
+  ignore_val = 1  # 忽略区域的值
   nuscenes_att_range = {0: [0, 1], 1: [0, 1], 2: [2, 3, 4], 3: [2, 3, 4], 
-    4: [2, 3, 4], 5: [5, 6, 7], 6: [5, 6, 7], 7: [5, 6, 7]}
+    4: [2, 3, 4], 5: [5, 6, 7], 6: [5, 6, 7], 7: [5, 6, 7]}  # nuScenes属性范围映射
   
-  ## change these vectors to actual mean and std to normalize
-  pc_mean = np.zeros((18,1))
-  pc_std = np.ones((18,1))
-  img_ind = 0
+  # 点云数据归一化参数(需要根据实际数据调整)
+  pc_mean = np.zeros((18,1))  # 点云数据归一化均值
+  pc_std = np.ones((18,1))  # 点云数据归一化标准差
+  img_ind = 0  # 图像索引(用于调试)
 
 
   def __init__(self, opt=None, split=None, ann_path=None, img_dir=None):
+    """数据集初始化
+    
+    参数:
+      opt: 配置对象，包含所有训练参数
+      split: 数据集划分('train','val'等)
+      ann_path: 标注文件路径
+      img_dir: 图像目录路径
+    """
     super(GenericDataset, self).__init__()
     if opt is not None and split is not None:
-      self.split = split
-      self.opt = opt
-      self._data_rng = np.random.RandomState(123)
+      self.split = split  # 数据集划分
+      self.opt = opt  # 配置对象
+      self._data_rng = np.random.RandomState(123)  # 随机数生成器(固定种子)
+      # 是否启用元数据(用于评估)
       self.enable_meta = True if (opt.run_dataset_eval and split in ["val", "mini_val", "test"]) or opt.eval else False
     
     if ann_path is not None and img_dir is not None:
       print('==> initializing {} data from {}, \n images from {} ...'.format(
         split, ann_path, img_dir))
+      # 加载COCO格式标注
       self.coco = coco.COCO(ann_path)
-      self.images = self.coco.getImgIds()
+      self.images = self.coco.getImgIds()  # 获取所有图像ID
 
+      # 处理跟踪任务相关数据
       if opt.tracking:
+        # 如果没有视频信息，创建伪视频数据
         if not ('videos' in self.coco.dataset):
           self.fake_video_data()
         print('Creating video index!')
+        # 创建视频到图像的映射
         self.video_to_images = defaultdict(list)
         for image in self.coco.dataset['images']:
           self.video_to_images[image['video_id']].append(image)
       
-      self.img_dir = img_dir
+      self.img_dir = img_dir  # 图像目录路径
 
 
   def __getitem__(self, index):
+    """获取数据集中的一个样本
+    
+    参数:
+      index: 样本索引
+      
+    返回:
+      包含图像、标注和预处理结果的字典
+    """
     opt = self.opt
+    # 加载图像和标注数据
     img, anns, img_info, img_path = self._load_data(index)
     height, width = img.shape[0], img.shape[1]
 
-    ## sort annotations based on depth form far to near
+    # 根据深度从远到近排序标注(用于处理遮挡)
     new_anns = sorted(anns, key=lambda k: k['depth'], reverse=True)
 
-    ## Get center and scale from image
+    # 计算图像中心和缩放比例
     c = np.array([img.shape[1] / 2., img.shape[0] / 2.], dtype=np.float32)
     s = max(img.shape[0], img.shape[1]) * 1.0 if not self.opt.not_max_crop \
       else np.array([img.shape[1], img.shape[0]], np.float32)
-    aug_s, rot, flipped = 1, 0, 0
+    aug_s, rot, flipped = 1, 0, 0  # 初始化增强参数
 
-    ## data augmentation for training set
+    # 训练集数据增强
     if 'train' in self.split:
+      # 获取随机增强参数(中心偏移、缩放、旋转)
       c, aug_s, rot = self._get_aug_param(c, s, width, height)
-      s = s * aug_s
+      s = s * aug_s  # 应用缩放
+      # 随机水平翻转
       if np.random.random() < opt.flip:
         flipped = 1
-        img = img[:, ::-1, :]
-        anns = self._flip_anns(anns, width)
+        img = img[:, ::-1, :]  # 翻转图像
+        anns = self._flip_anns(anns, width)  # 翻转标注
 
+    # 计算输入和输出的仿射变换矩阵
     trans_input = get_affine_transform(
-      c, s, rot, [opt.input_w, opt.input_h])
+      c, s, rot, [opt.input_w, opt.input_h])  # 输入图像变换
     trans_output = get_affine_transform(
-      c, s, rot, [opt.output_w, opt.output_h])
+      c, s, rot, [opt.output_w, opt.output_h])  # 输出热图变换
+    
+    # 获取预处理后的输入图像
     inp = self._get_input(img, trans_input)
-    ret = {'image': inp}
-    gt_det = {'bboxes': [], 'scores': [], 'clses': [], 'cts': []}
+    ret = {'image': inp}  # 初始化返回字典
+    gt_det = {'bboxes': [], 'scores': [], 'clses': [], 'cts': []}  # 初始化GT检测结果
 
-    #  load point cloud data
+    # 加载点云数据(如果启用)
     if opt.pointcloud:
-      pc_2d, pc_N, pc_dep, pc_3d = self._load_pc_data(img, img_info, 
-        trans_input, trans_output, flipped)
-      ret.update({ 'pc_2d': pc_2d,
-                   'pc_3d': pc_3d,
-                   'pc_N': pc_N,
-                   'pc_dep': pc_dep })
+      pc_2d, pc_N, pc_dep, pc_3d = self._load_pc_data(
+        img, img_info, trans_input, trans_output, flipped)
+      ret.update({ 
+        'pc_2d': pc_2d,  # 2D点云坐标
+        'pc_3d': pc_3d,  # 3D点云坐标
+        'pc_N': pc_N,    # 点云数量
+        'pc_dep': pc_dep  # 点云深度热图
+      })
 
+    # 处理跟踪任务相关数据
     pre_cts, track_ids = None, None
     if opt.tracking:
+      # 加载前一帧数据
       pre_image, pre_anns, frame_dist, pre_img_info = self._load_pre_data(
         img_info['video_id'], img_info['frame_id'], 
         img_info['sensor_id'] if 'sensor_id' in img_info else 1)
+      
+      # 如果当前帧翻转了，前一帧也需要相应处理
       if flipped:
-        pre_image = pre_image[:, ::-1, :].copy()
-        pre_anns = self._flip_anns(pre_anns, width)
+        pre_image = pre_image[:, ::-1, :].copy()  # 翻转前一帧图像
+        pre_anns = self._flip_anns(pre_anns, width)  # 翻转前一帧标注
         if pc_2d is not None:
-          pc_2d = self._flip_pc(pc_2d,  width)
+          pc_2d = self._flip_pc(pc_2d, width)  # 翻转点云数据
+      
+      # 计算前一帧的变换矩阵
       if opt.same_aug_pre and frame_dist != 0:
+        # 使用相同的变换参数
         trans_input_pre = trans_input 
         trans_output_pre = trans_output
       else:
+        # 获取新的随机变换参数
         c_pre, aug_s_pre, _ = self._get_aug_param(
           c, s, width, height, disturb=True)
         s_pre = s * aug_s_pre
@@ -157,19 +228,28 @@ class GenericDataset(data.Dataset):
           c_pre, s_pre, rot, [opt.input_w, opt.input_h])
         trans_output_pre = get_affine_transform(
           c_pre, s_pre, rot, [opt.output_w, opt.output_h])
+      
+      # 预处理前一帧图像
       pre_img = self._get_input(pre_image, trans_input_pre)
+      # 获取前一帧的检测结果(用于跟踪)
       pre_hm, pre_cts, track_ids = self._get_pre_dets(
         pre_anns, trans_input_pre, trans_output_pre)
+      
+      # 将前一帧信息添加到返回字典
       ret['pre_img'] = pre_img
       if opt.pre_hm:
-        ret['pre_hm'] = pre_hm
+        ret['pre_hm'] = pre_hm  # 前一帧热图
+      
+      # 处理前一帧的点云数据
       if opt.pointcloud:
-        pre_pc_2d, pre_pc_N, pre_pc_hm, pre_pc_3d = self._load_pc_data(pre_img, pre_img_info, 
-            trans_input_pre, trans_output_pre, flipped)
-        ret['pre_pc_2d'] = pre_pc_2d
-        ret['pre_pc_3d'] = pre_pc_3d
-        ret['pre_pc_N'] = pre_pc_N
-        ret['pre_pc_hm'] = pre_pc_hm
+        pre_pc_2d, pre_pc_N, pre_pc_hm, pre_pc_3d = self._load_pc_data(
+          pre_img, pre_img_info, trans_input_pre, trans_output_pre, flipped)
+        ret.update({
+          'pre_pc_2d': pre_pc_2d,  # 前一帧2D点云
+          'pre_pc_3d': pre_pc_3d,  # 前一帧3D点云
+          'pre_pc_N': pre_pc_N,    # 前一帧点云数量
+          'pre_pc_hm': pre_pc_hm  # 前一帧点云热图
+        })
 
     ### init samples
     self._init_ret(ret, gt_det)
@@ -214,20 +294,44 @@ class GenericDataset(data.Dataset):
     return calib
 
   def _load_image_anns(self, img_id, coco, img_dir):
-    img_info = coco.loadImgs(ids=[img_id])[0]
-    file_name = img_info['file_name']
-    img_path = os.path.join(img_dir, file_name)
-    ann_ids = coco.getAnnIds(imgIds=[img_id])
-    anns = copy.deepcopy(coco.loadAnns(ids=ann_ids))
-    img = cv2.imread(img_path)
+    """加载图像和对应的标注信息
+    
+    参数:
+      img_id: 图像ID
+      coco: COCO数据集对象
+      img_dir: 图像目录路径
+      
+    返回:
+      img: 加载的图像数据
+      anns: 该图像的标注信息
+      img_info: 图像元信息
+      img_path: 图像文件路径
+    """
+    img_info = coco.loadImgs(ids=[img_id])[0]  # 加载图像元信息
+    file_name = img_info['file_name']  # 获取文件名
+    img_path = os.path.join(img_dir, file_name)  # 拼接完整路径
+    ann_ids = coco.getAnnIds(imgIds=[img_id])  # 获取该图像的所有标注ID
+    anns = copy.deepcopy(coco.loadAnns(ids=ann_ids))  # 加载标注信息(深拷贝)
+    img = cv2.imread(img_path)  # 读取图像
     return img, anns, img_info, img_path
 
   def _load_data(self, index):
-    coco = self.coco
-    img_dir = self.img_dir
-    img_id = self.images[index]
+    """根据索引加载数据
+    
+    参数:
+      index: 数据索引
+      
+    返回:
+      img: 加载的图像数据
+      anns: 该图像的标注信息
+      img_info: 图像元信息
+      img_path: 图像文件路径
+    """
+    coco = self.coco  # COCO数据集对象
+    img_dir = self.img_dir  # 图像目录
+    img_id = self.images[index]  # 获取指定索引的图像ID
+    # 加载图像和标注信息
     img, anns, img_info, img_path = self._load_image_anns(img_id, coco, img_dir)
-
     return img, anns, img_info, img_path
 
 
@@ -627,73 +731,116 @@ class GenericDataset(data.Dataset):
 
   ## Augment, resize and normalize the image
   def _get_input(self, img, trans_input):
+    """对输入图像进行预处理
+    
+    参数:
+      img: 原始图像
+      trans_input: 输入变换矩阵
+      
+    返回:
+      预处理后的图像张量
+    """
+    # 应用仿射变换调整图像大小
     inp = cv2.warpAffine(img, trans_input, 
                         (self.opt.input_w, self.opt.input_h),
                         flags=cv2.INTER_LINEAR)
     
+    # 归一化到0-1范围
     inp = (inp.astype(np.float32) / 255.)
+    
+    # 训练集应用颜色增强
     if 'train' in self.split and not self.opt.no_color_aug:
       color_aug(self._data_rng, inp, self._eig_val, self._eig_vec)
+    
+    # 标准化处理
     inp = (inp - self.mean) / self.std
+    
+    # 调整通道顺序为CxHxW
     inp = inp.transpose(2, 0, 1)
+    
     return inp
 
 
   def _init_ret(self, ret, gt_det):
-    max_objs = self.max_objs * self.opt.dense_reg
+    """初始化返回字典和GT检测结果
+    
+    参数:
+      ret: 返回字典，将存储所有网络输出
+      gt_det: GT检测结果字典，用于评估
+    """
+    max_objs = self.max_objs * self.opt.dense_reg  # 考虑密集回归的最大目标数
+    
+    # 初始化热图
     ret['hm'] = np.zeros(
       (self.opt.num_classes, self.opt.output_h, self.opt.output_w), 
       np.float32)
-    ret['ind'] = np.zeros((max_objs), dtype=np.int64)
-    ret['cat'] = np.zeros((max_objs), dtype=np.int64)
-    ret['mask'] = np.zeros((max_objs), dtype=np.float32)
     
+    # 初始化索引、类别和掩码
+    ret['ind'] = np.zeros((max_objs), dtype=np.int64)  # 目标索引
+    ret['cat'] = np.zeros((max_objs), dtype=np.int64)  # 目标类别
+    ret['mask'] = np.zeros((max_objs), dtype=np.float32)  # 目标掩码
+    
+    # 初始化点云热图(如果启用)
     if self.opt.pointcloud:
       ret['pc_hm'] = np.zeros(
         (len(self.opt.pc_feat_lvl), self.opt.output_h, self.opt.output_w), 
         np.float32)
 
+    # 定义各种回归头的维度
     regression_head_dims = {
       'reg': 2, 'wh': 2, 'tracking': 2, 'ltrb': 4, 'ltrb_amodal': 4, 
       'nuscenes_att': 8, 'velocity': 3, 'hps': self.num_joints * 2, 
       'dep': 1, 'dim': 3, 'amodel_offset': 2 }
 
+    # 初始化各种回归头
     for head in regression_head_dims:
       if head in self.opt.heads:
-        ret[head] = np.zeros(
+        ret[head] = np.zeros(  # 回归值
           (max_objs, regression_head_dims[head]), dtype=np.float32)
-        ret[head + '_mask'] = np.zeros(
+        ret[head + '_mask'] = np.zeros(  # 回归掩码
           (max_objs, regression_head_dims[head]), dtype=np.float32)
-        gt_det[head] = []
-    # if self.opt.pointcloud:
-    #     ret['pc_dep_mask'] = np.zeros((max_objs, 1), dtype=np.float32)
-    #     ret['pc_dep'] = np.zeros((max_objs, 1), dtype=np.float32)
-    #     gt_det['pc_dep'] = []
+        gt_det[head] = []  # GT检测结果
 
+    # 初始化关键点热图(如果启用)
     if 'hm_hp' in self.opt.heads:
       num_joints = self.num_joints
-      ret['hm_hp'] = np.zeros(
+      ret['hm_hp'] = np.zeros(  # 关键点热图
         (num_joints, self.opt.output_h, self.opt.output_w), dtype=np.float32)
-      ret['hm_hp_mask'] = np.zeros(
+      ret['hm_hp_mask'] = np.zeros(  # 关键点热图掩码
         (max_objs * num_joints), dtype=np.float32)
-      ret['hp_offset'] = np.zeros(
+      ret['hp_offset'] = np.zeros(  # 关键点偏移
         (max_objs * num_joints, 2), dtype=np.float32)
-      ret['hp_ind'] = np.zeros((max_objs * num_joints), dtype=np.int64)
-      ret['hp_offset_mask'] = np.zeros(
+      ret['hp_ind'] = np.zeros(  # 关键点索引
+        (max_objs * num_joints), dtype=np.int64)
+      ret['hp_offset_mask'] = np.zeros(  # 关键点偏移掩码
         (max_objs * num_joints, 2), dtype=np.float32)
-      ret['joint'] = np.zeros((max_objs * num_joints), dtype=np.int64)
+      ret['joint'] = np.zeros(  # 关节索引
+        (max_objs * num_joints), dtype=np.int64)
     
+    # 初始化旋转信息(如果启用)
     if 'rot' in self.opt.heads:
-      ret['rotbin'] = np.zeros((max_objs, 2), dtype=np.int64)
-      ret['rotres'] = np.zeros((max_objs, 2), dtype=np.float32)
-      ret['rot_mask'] = np.zeros((max_objs), dtype=np.float32)
-      gt_det.update({'rot': []})
+      ret['rotbin'] = np.zeros((max_objs, 2), dtype=np.int64)  # 旋转bin
+      ret['rotres'] = np.zeros((max_objs, 2), dtype=np.float32)  # 旋转残差
+      ret['rot_mask'] = np.zeros((max_objs), dtype=np.float32)  # 旋转掩码
+      gt_det.update({'rot': []})  # GT旋转信息
 
 
   def _get_calib(self, img_info, width, height):
+    """获取相机标定矩阵
+    
+    参数:
+      img_info: 图像元信息
+      width: 图像宽度
+      height: 图像高度
+      
+    返回:
+      3x4相机标定矩阵
+    """
     if 'calib' in img_info:
+      # 如果图像信息中包含标定数据，则直接使用
       calib = np.array(img_info['calib'], dtype=np.float32)
     else:
+      # 否则使用默认标定参数
       calib = np.array([[self.rest_focal_length, 0, width / 2, 0], 
                         [0, self.rest_focal_length, height / 2, 0], 
                         [0, 0, 1, 0]])
